@@ -3,4 +3,4 @@ pyspark
 yfinance
 plotly
 pandas
-openjdk
+
