@@ -12,8 +12,12 @@ import plotly.express as px
 import plotly.graph_objects as go
 
 # =====================================================================
-# INITIALIZE SPARK WITH CONFIGURATION TO ALLOW BIG RESULTS
+# INITIALIZE SPARK
 # =====================================================================
+# 1) Autoriser des gros résultats
+# 2) (Optionnel) On peut aussi essayer d'augmenter la mémoire driver :
+#    .config("spark.driver.memory", "1g")
+#    Mais sur un plan 512 MB, ça ne changera pas la limite physique.
 spark = SparkSession.builder \
     .appName("StockAnalysis") \
     .config("spark.driver.maxResultSize", "2g") \
@@ -22,22 +26,35 @@ spark = SparkSession.builder \
 # =====================================================================
 # DATA LOADING AND PREPROCESSING FUNCTIONS
 # =====================================================================
-def load_data(ticker, start_date, end_date):
+def load_data(ticker, start_date, end_date, max_rows=2000):
+    """
+    Charge les données depuis yfinance, crée un DataFrame Spark,
+    partitionne par Ticker, puis limite le nombre de lignes (max_rows)
+    pour éviter un excès de mémoire.
+    """
     data = yf.download(ticker, start=start_date, end=end_date)
     data.reset_index(inplace=True)
     # Convertir les noms de colonnes en chaînes simples
     data.columns = [c if isinstance(c, str) else c[0] for c in data.columns]
-    # Ajout de la colonne "Ticker" pour permettre un partitionnement correct
+
+    # Ajouter la colonne "Ticker" pour partitionner plus tard
     data['Ticker'] = ticker
+
     sdf = spark.createDataFrame(data)
     sdf = sdf.withColumn("Date", to_date(col("Date"), "yyyy-MM-dd"))
+
     numeric_cols = ["Open", "Close", "High", "Low", "Volume"]
     for nc in numeric_cols:
         sdf = sdf.withColumn(nc, col(nc).cast("double"))
+
+    # IMPORTANT : on limite le nombre de lignes pour éviter
+    # de saturer la RAM dans un environnement gratuit
+    sdf = sdf.limit(max_rows)
+
     return sdf
 
 def detect_periodicity(df):
-    # Utiliser partitionBy("Ticker") pour éviter de rassembler toutes les données
+    # Partition par Ticker pour éviter qu'une seule partition ne contienne tout
     w = Window.partitionBy("Ticker").orderBy("Date")
     df_temp = df.withColumn("Prev_Date", lag("Date").over(w))
     df_temp = df_temp.withColumn("Diff", datediff(col("Date"), col("Prev_Date")))
@@ -54,7 +71,7 @@ def detect_periodicity(df):
         return f"{avg_diff:.1f} days (non standard)"
 
 def add_moving_average(df, column_name, window_size):
-    # Calcul de la moyenne mobile en partitionnant par Ticker
+    # Fenêtre partitionnée
     window_spec = Window.partitionBy("Ticker").orderBy("Date").rowsBetween(-window_size, 0)
     new_column_name = f"Moving Average ({window_size} days)"
     return df.withColumn(new_column_name, avg(column_name).over(window_spec))
@@ -110,9 +127,15 @@ def calculate_periodic_returns(df, period):
 def best_stock_in_period(tickers, start_date, end_date, period, min_volume=0):
     best_stock = None
     best_return = float('-inf')
-    return_col = {"weekly": "Weekly Return", "monthly": "Monthly Return", "yearly": "Yearly Return"}.get(period, None)
+    return_col = {
+        "weekly": "Weekly Return",
+        "monthly": "Monthly Return",
+        "yearly": "Yearly Return"
+    }.get(period, None)
+
     for name, ticker in tickers.items():
-        df_tmp = load_data(ticker, start_date, end_date)
+        # Charger et limiter
+        df_tmp = load_data(ticker, start_date, end_date, max_rows=2000)
         df_tmp = df_tmp.filter(col("Volume") >= min_volume)
         df_period = calculate_periodic_returns(df_tmp, period)
         if return_col is None:
@@ -121,19 +144,23 @@ def best_stock_in_period(tickers, start_date, end_date, period, min_volume=0):
         if avg_r is not None and avg_r > best_return:
             best_return = avg_r
             best_stock = name
+
     return best_stock, best_return if best_return != float('-inf') else None
 
 def avg_open_close_different_periods(df):
     results = {}
-    df_weekly = df.withColumn("Week", col("Date").substr(1, 7))
+    df_weekly = df.withColumn("Week", col("Date").substr(1,7))
     df_weekly = df_weekly.groupBy("Week").agg(avg("Open").alias("Avg Open"), avg("Close").alias("Avg Close"))
     results["weekly"] = df_weekly
-    df_monthly = df.withColumn("Month", col("Date").substr(1, 7))
+
+    df_monthly = df.withColumn("Month", col("Date").substr(1,7))
     df_monthly = df_monthly.groupBy("Month").agg(avg("Open").alias("Avg Open"), avg("Close").alias("Avg Close"))
     results["monthly"] = df_monthly
-    df_yearly = df.withColumn("Year", col("Date").substr(1, 4))
+
+    df_yearly = df.withColumn("Year", col("Date").substr(1,4))
     df_yearly = df_yearly.groupBy("Year").agg(avg("Open").alias("Avg Open"), avg("Close").alias("Avg Close"))
     results["yearly"] = df_yearly
+
     return results
 
 # =====================================================================
@@ -186,7 +213,8 @@ def main():
         st.sidebar.error("Start Date must be earlier than End Date.")
         st.stop()
 
-    df_spark = load_data(tickers[selected_stock], start_date.strftime("%Y-%m-%d"), end_date.strftime("%Y-%m-%d"))
+    # Charger + limiter la data
+    df_spark = load_data(tickers[selected_stock], start_date.strftime("%Y-%m-%d"), end_date.strftime("%Y-%m-%d"), max_rows=2000)
 
     st.title("Stock Analysis Application")
     st.subheader(f"Selected stock: {selected_stock}")
@@ -198,10 +226,11 @@ def main():
         "Conclusions"
     ])
 
+    # ==================== 1) OVERVIEW ====================
     with tab_overview:
         st.write("### Total Number of Observations")
         nb_obs = df_spark.count()
-        st.info(f"**Total rows:** {nb_obs}")
+        st.info(f"**Total rows (limited):** {nb_obs}")
 
         col1, col2 = st.columns(2)
         with col1:
@@ -222,14 +251,15 @@ def main():
         detected = detect_periodicity(df_spark)
         st.write(f"### Detected Periodicity: {detected}")
 
+    # ==================== 2) TIME SERIES ANALYSIS ====================
     with tab_time_series:
         st.subheader("Time Series Analysis")
-        # Fenêtre partitionnée par Ticker pour les opérations quotidiennes
+
+        # Fenêtre partitionnée par Ticker
         window_daily = Window.partitionBy("Ticker").orderBy("Date")
         df_spark = df_spark.withColumn("Close_Lag1", lag("Close", 1).over(window_daily))
         df_spark = df_spark.withColumn("Daily Price Change", col("Close") - col("Close_Lag1"))
 
-        # Pour les opérations mensuelles, partitionner par MonthID (exemple)
         df_spark = df_spark.withColumn("MonthID", col("Date").substr(1, 7))
         window_monthly = Window.partitionBy("MonthID").orderBy("Date")
         df_spark = df_spark.withColumn(
@@ -237,7 +267,6 @@ def main():
             spark_first("Close").over(window_monthly.rowsBetween(Window.unboundedPreceding, Window.unboundedFollowing))
         )
         df_spark = df_spark.withColumn("Monthly Price Change", col("Close") - col("Close_FirstOfMonth"))
-
         df_spark = df_spark.withColumn("Daily Return", (col("Close") - col("Open")) / col("Open") * 100)
 
         st.write("### Top 5 Daily Returns")
@@ -277,6 +306,7 @@ def main():
         periodic_df = calculate_periodic_returns(df_spark, period_for_returns).toPandas()
         st.dataframe(periodic_df)
 
+    # ==================== 3) CORRELATIONS ====================
     with tab_corr:
         st.subheader("Correlations")
         best_s, best_r = best_stock_in_period(
@@ -305,9 +335,10 @@ def main():
             if stock1 == stock2:
                 st.info("Select two different stocks for correlation.")
             else:
-                df1 = load_data(tickers[stock1], start_date.strftime("%Y-%m-%d"), end_date.strftime("%Y-%m-%d")) \
+                # Charger + limiter chaque Ticker
+                df1 = load_data(tickers[stock1], start_date.strftime("%Y-%m-%d"), end_date.strftime("%Y-%m-%d"), max_rows=2000) \
                         .select("Date", "Close").orderBy("Date").toPandas()
-                df2 = load_data(tickers[stock2], start_date.strftime("%Y-%m-%d"), end_date.strftime("%Y-%m-%d")) \
+                df2 = load_data(tickers[stock2], start_date.strftime("%Y-%m-%d"), end_date.strftime("%Y-%m-%d"), max_rows=2000) \
                         .select("Date", "Close").orderBy("Date").toPandas()
                 merged_df = pd.merge(df1, df2, on="Date", suffixes=(f"_{stock1}", f"_{stock2}"))
                 if not merged_df.empty:
@@ -317,9 +348,10 @@ def main():
                     st.warning("No common data available for the two stocks.")
 
         st.write("#### Inter-Stock Correlation (Based on Close)")
+        # Charger + limiter chaque Ticker
         tickers_corr_data = pd.concat(
             [
-                load_data(tickers[name], start_date.strftime("%Y-%m-%d"), end_date.strftime("%Y-%m-%d"))
+                load_data(tickers[name], start_date.strftime("%Y-%m-%d"), end_date.strftime("%Y-%m-%d"), max_rows=2000)
                     .select("Close").withColumnRenamed("Close", name).toPandas()
                 for name in tickers.keys()
             ],
@@ -328,6 +360,7 @@ def main():
         fig_corr = px.imshow(tickers_corr_data, text_auto=True, title="Correlation Matrix (Stocks)")
         st.plotly_chart(fig_corr, use_container_width=True)
 
+    # ==================== 4) CONCLUSIONS ====================
     with tab_conclusions:
         st.subheader("Conclusions & Insights")
         st.markdown("""
@@ -341,14 +374,14 @@ def main():
         </style>
         """, unsafe_allow_html=True)
         insights = [
-            "1. The total number of observations evaluates historical depth (reliability).",
-            "2. The detected periodicity confirms the type of data (daily, weekly, etc.).",
-            "3. Daily returns help identify particularly volatile days.",
-            "4. Moving averages reveal medium/long-term trends.",
-            "5. The OHLC candlestick chart provides a clear view of price evolution.",
+            "1. The total number of observations is limited to avoid memory issues.",
+            "2. The detected periodicity confirms the data frequency (daily, weekly, etc.).",
+            "3. Daily returns highlight particularly volatile days.",
+            "4. Moving averages show medium/long-term trends.",
+            "5. The candlestick chart provides a clear view of price evolution.",
             "6. The volume chart illustrates trading intensity (liquidity).",
-            "7. Both internal and inter-stock correlations guide diversification.",
-            "8. Analysis of top-performing periods helps identify investment opportunities."
+            "7. Correlations guide diversification across different stocks.",
+            "8. Top-performing periods can help identify investment opportunities."
         ]
         for ins in insights:
             st.markdown(f"<div class='insight-box'>{ins}</div>", unsafe_allow_html=True)
