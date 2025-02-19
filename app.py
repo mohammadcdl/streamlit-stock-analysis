@@ -19,17 +19,10 @@ spark = SparkSession.builder.appName("StockAnalysis").getOrCreate()
 # =====================================================================
 # UTILITY FUNCTIONS
 # =====================================================================
-
 def compute_stock_correlation(series1, series2):
-    """
-    Compute the correlation between two value series (pandas Series).
-    """
     return series1.corr(series2)
 
 def add_moving_average(df, column_name, window_size):
-    """
-    Add a column with the moving average calculated over 'window_size' periods for the column 'column_name'.
-    """
     window_spec = Window.orderBy("Date").rowsBetween(-window_size, 0)
     new_column_name = f"Moving Average ({window_size} days)"
     return df.withColumn(new_column_name, avg(column_name).over(window_spec))
@@ -37,15 +30,12 @@ def add_moving_average(df, column_name, window_size):
 # =====================================================================
 # DATA LOADING AND PREPROCESSING FUNCTIONS
 # =====================================================================
-
 def load_data(ticker, start_date, end_date):
     data = yf.download(ticker, start=start_date, end=end_date)
     data.reset_index(inplace=True)
     data.columns = [c if isinstance(c, str) else c[0] for c in data.columns]
-
     sdf = spark.createDataFrame(data)
     sdf = sdf.withColumn("Date", to_date(col("Date"), "yyyy-MM-dd"))
-
     numeric_cols = ["Open", "Close", "High", "Low", "Volume"]
     for nc in numeric_cols:
         sdf = sdf.withColumn(nc, col(nc).cast("double"))
@@ -54,14 +44,7 @@ def load_data(ticker, start_date, end_date):
 # =====================================================================
 # OHLC RESAMPLING FUNCTIONS
 # =====================================================================
-
 def resample_ohlc_spark(df, timeframe):
-    """
-    Aggregate OHLC data based on the desired granularity:
-      - daily: no aggregation (returns the DataFrame as is)
-      - weekly: group by year and week (weekofyear)
-      - monthly: group by year and month
-    """
     if timeframe == "daily":
         return df
     elif timeframe == "weekly":
@@ -94,12 +77,10 @@ def resample_ohlc_spark(df, timeframe):
 # =====================================================================
 # EXPLORATION AND ANALYSIS FUNCTIONS
 # =====================================================================
-
 def detect_periodicity(df):
     w = Window.orderBy("Date")
     df_temp = df.withColumn("Prev_Date", lag("Date").over(w))
     df_temp = df_temp.withColumn("Diff", datediff(col("Date"), col("Prev_Date")))
-
     avg_diff = df_temp.select(avg("Diff").alias("avgDiff")).first()["avgDiff"]
     if avg_diff is None:
         return "N/A"
@@ -136,7 +117,6 @@ def best_stock_in_period(tickers, start_date, end_date, period, min_volume=0):
     for name, ticker in tickers.items():
         df_tmp = load_data(ticker, start_date, end_date)
         df_tmp = df_tmp.filter(col("Volume") >= min_volume)
-
         df_period = calculate_periodic_returns(df_tmp, period)
         if return_col is None:
             continue
@@ -149,7 +129,6 @@ def best_stock_in_period(tickers, start_date, end_date, period, min_volume=0):
 
 def avg_open_close_different_periods(df):
     results = {}
-
     df_weekly = df.withColumn("Week", col("Date").substr(1,7))
     df_weekly = df_weekly.groupBy("Week").agg(avg("Open").alias("Avg Open"), avg("Close").alias("Avg Close"))
     results["weekly"] = df_weekly
@@ -161,13 +140,11 @@ def avg_open_close_different_periods(df):
     df_yearly = df.withColumn("Year", col("Date").substr(1,4))
     df_yearly = df_yearly.groupBy("Year").agg(avg("Open").alias("Avg Open"), avg("Close").alias("Avg Close"))
     results["yearly"] = df_yearly
-
     return results
 
 # =====================================================================
 # VISUALIZATION FUNCTIONS
 # =====================================================================
-
 def plot_visualizations(df, title, x, y):
     pdf = df.select(x, y).toPandas()
     fig = px.line(pdf, x=x, y=y, title=title)
@@ -199,9 +176,7 @@ def plot_volume(df):
 # =====================================================================
 # STREAMLIT APPLICATION
 # =====================================================================
-
 def main():
-    # ---------------- Sidebar ------------------
     st.sidebar.title("Options")
     tickers = {"Apple": "AAPL", "Microsoft": "MSFT", "Amazon": "AMZN", "Tesla": "TSLA"}
 
@@ -217,14 +192,11 @@ def main():
         st.sidebar.error("Start Date must be earlier than End Date.")
         st.stop()
 
-    # ---------------- Main Data ------------------
     df_spark = load_data(tickers[selected_stock], start_date.strftime("%Y-%m-%d"), end_date.strftime("%Y-%m-%d"))
 
-    # Main Title
     st.title("Stock Analysis Application")
     st.subheader(f"Selected stock: {selected_stock}")
 
-    # Tabs for better organization
     tab_overview, tab_time_series, tab_corr, tab_conclusions = st.tabs([
         "Data Overview",
         "Time Series Analysis",
@@ -246,17 +218,14 @@ def main():
             st.write("**Last 40 rows**")
             st.dataframe(df_spark.orderBy(col("Date").desc()).limit(40).toPandas())
 
-        # Descriptive statistics for all numeric columns
         st.write("### Descriptive Statistics")
         stats = df_spark.describe("Open", "Close", "High", "Low", "Volume").toPandas()
         st.table(stats)
 
-        # Missing values
         st.write("### Missing Values")
         missing = df_spark.select([count(when(col(c).isNull(), c)).alias(c) for c in df_spark.columns]).toPandas()
         st.table(missing)
 
-        # Detect periodicity
         detected = detect_periodicity(df_spark)
         st.write(f"### Detected Periodicity: {detected}")
 
@@ -264,7 +233,6 @@ def main():
     with tab_time_series:
         st.subheader("Time Series Analysis")
 
-        # Create columns "Daily Price Change" and "Monthly Price Change"
         window_daily = Window.orderBy("Date")
         df_spark = df_spark.withColumn("Close_Lag1", lag("Close", 1).over(window_daily))
         df_spark = df_spark.withColumn("Daily Price Change", col("Close") - col("Close_Lag1"))
@@ -277,19 +245,15 @@ def main():
         )
         df_spark = df_spark.withColumn("Monthly Price Change", col("Close") - col("Close_FirstOfMonth"))
 
-        # Calculate daily returns
         df_spark = df_spark.withColumn("Daily Return", (col("Close") - col("Open")) / col("Open") * 100)
 
-        # Top 5 daily returns with percentage format
         st.write("### Top 5 Daily Returns")
         top_5_returns = df_spark.orderBy(col("Daily Return").desc()).limit(5).toPandas()
         top_5_returns["Daily Return"] = top_5_returns["Daily Return"].apply(lambda x: f"{x:.2f}%")
         st.table(top_5_returns[["Date", "Open", "Close", "Daily Return"]])
 
-        # Averages of opening and closing prices over different periods
         st.write("### Average Open and Close Prices (Weekly / Monthly / Yearly)")
         multi_avg = avg_open_close_different_periods(df_spark)
-
         with st.expander("Periods: Weekly / Monthly / Yearly"):
             c1, c2, c3 = st.columns(3)
             with c1:
@@ -302,25 +266,20 @@ def main():
                 st.write("**Yearly**")
                 st.dataframe(multi_avg["yearly"].toPandas())
 
-        # Time series visualizations
         st.write("### Time Series Visualizations")
         plot_visualizations(df_spark, "Daily Returns", "Date", "Daily Return")
         plot_visualizations(df_spark, "Daily Price Change", "Date", "Daily Price Change")
         plot_volatility(df_spark)
 
-        # Candlestick chart with selected granularity
         df_candle = resample_ohlc_spark(df_spark, candlestick_timeframe)
         plot_candlestick(df_candle, title=f"Candlestick Chart ({candlestick_timeframe})")
 
-        # Volume chart
         plot_volume(df_spark)
 
-        # Moving average via dedicated function
         df_spark = add_moving_average(df_spark, "Close", window_size)
         moving_avg_col = f"Moving Average ({window_size} days)"
         plot_visualizations(df_spark, f"Moving Average ({window_size} days)", "Date", moving_avg_col)
 
-        # Returns by period (sidebar choice)
         st.write(f"### Returns by Period: {period_for_returns}")
         periodic_df = calculate_periodic_returns(df_spark, period_for_returns).toPandas()
         st.dataframe(periodic_df)
@@ -328,8 +287,6 @@ def main():
     # ==================== 3) TAB: Correlations ====================
     with tab_corr:
         st.subheader("Correlations")
-
-        # Best stock by period
         best_s, best_r = best_stock_in_period(
             tickers,
             start_date.strftime("%Y-%m-%d"),
@@ -343,16 +300,12 @@ def main():
         else:
             st.warning("Unable to determine the best stock (insufficient data or filter too restrictive).")
 
-        st.write("---")
-        # Internal correlation (columns of the same stock)
         st.write("#### Internal Correlation (Open, Close, High, Low, Volume)")
         df_cols = df_spark.select("Open", "Close", "High", "Low", "Volume").toPandas()
         corr_matrix_ticker = df_cols.corr()
         fig_cols_corr = px.imshow(corr_matrix_ticker, text_auto=True, title=f"Column Correlation - {selected_stock}")
         st.plotly_chart(fig_cols_corr, use_container_width=True)
 
-        st.write("---")
-        # Correlation between two selected stocks (using dedicated function)
         st.write("#### Correlation Between Two Selected Stocks")
         stock1 = st.selectbox("Select the first stock", list(tickers.keys()), key="stock1")
         stock2 = st.selectbox("Select the second stock", list(tickers.keys()), key="stock2")
@@ -371,8 +324,6 @@ def main():
                 else:
                     st.warning("No common data available for the two stocks.")
 
-        st.write("---")
-        # Inter-stock correlation matrix (based on 'Close')
         st.write("#### Inter-Stock Correlation (Based on Close)")
         tickers_corr_data = pd.concat(
             [
@@ -385,7 +336,7 @@ def main():
         fig_corr = px.imshow(tickers_corr_data, text_auto=True, title="Correlation Matrix (Stocks)")
         st.plotly_chart(fig_corr, use_container_width=True)
 
-    # ==================== 4) TAB: Conclusions (Insights) ====================
+    # ==================== 4) TAB: Conclusions ====================
     with tab_conclusions:
         st.subheader("Conclusions & Insights")
         st.markdown("""
@@ -398,13 +349,12 @@ def main():
         }
         </style>
         """, unsafe_allow_html=True)
-
         insights = [
             "1. The total number of observations evaluates historical depth (reliability).",
             "2. The detected periodicity confirms the type of data (daily, weekly, etc.).",
             "3. Daily returns help identify particularly volatile days.",
             "4. Moving averages reveal medium/long-term trends.",
-            "5. The OHLC candlestick chart provides a clear view of price evolution over the chosen timeframe (daily/weekly/monthly).",
+            "5. The OHLC candlestick chart provides a clear view of price evolution.",
             "6. The volume chart illustrates trading intensity (liquidity).",
             "7. Both internal and inter-stock correlations guide diversification.",
             "8. Analysis of top-performing periods helps identify investment opportunities."
