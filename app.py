@@ -17,29 +17,44 @@ import plotly.graph_objects as go
 spark = SparkSession.builder.appName("StockAnalysis").getOrCreate()
 
 # =====================================================================
-# UTILITY FUNCTIONS
-# =====================================================================
-def compute_stock_correlation(series1, series2):
-    return series1.corr(series2)
-
-def add_moving_average(df, column_name, window_size):
-    window_spec = Window.orderBy("Date").rowsBetween(-window_size, 0)
-    new_column_name = f"Moving Average ({window_size} days)"
-    return df.withColumn(new_column_name, avg(column_name).over(window_spec))
-
-# =====================================================================
 # DATA LOADING AND PREPROCESSING FUNCTIONS
 # =====================================================================
 def load_data(ticker, start_date, end_date):
     data = yf.download(ticker, start=start_date, end=end_date)
     data.reset_index(inplace=True)
+    # Assurer que toutes les colonnes sont des chaînes simples
     data.columns = [c if isinstance(c, str) else c[0] for c in data.columns]
+    # Ajouter la colonne "Ticker" pour pouvoir partitionner par stock
+    data['Ticker'] = ticker
     sdf = spark.createDataFrame(data)
     sdf = sdf.withColumn("Date", to_date(col("Date"), "yyyy-MM-dd"))
     numeric_cols = ["Open", "Close", "High", "Low", "Volume"]
     for nc in numeric_cols:
         sdf = sdf.withColumn(nc, col(nc).cast("double"))
     return sdf
+
+def detect_periodicity(df):
+    # Partitionner par Ticker pour des données multiples (même si ici il n'y a qu'un stock)
+    w = Window.partitionBy("Ticker").orderBy("Date")
+    df_temp = df.withColumn("Prev_Date", lag("Date").over(w))
+    df_temp = df_temp.withColumn("Diff", datediff(col("Date"), col("Prev_Date")))
+    avg_diff = df_temp.select(avg("Diff").alias("avgDiff")).first()["avgDiff"]
+    if avg_diff is None:
+        return "N/A"
+    if 0.9 <= avg_diff <= 1.1:
+        return "daily"
+    elif 6 <= avg_diff <= 8:
+        return "weekly"
+    elif 28 <= avg_diff <= 31:
+        return "monthly"
+    else:
+        return f"{avg_diff:.1f} days (non standard)"
+
+def add_moving_average(df, column_name, window_size):
+    # Calculer la moyenne mobile en partitionnant par Ticker
+    window_spec = Window.partitionBy("Ticker").orderBy("Date").rowsBetween(-window_size, 0)
+    new_column_name = f"Moving Average ({window_size} days)"
+    return df.withColumn(new_column_name, avg(column_name).over(window_spec))
 
 # =====================================================================
 # OHLC RESAMPLING FUNCTIONS
@@ -77,22 +92,6 @@ def resample_ohlc_spark(df, timeframe):
 # =====================================================================
 # EXPLORATION AND ANALYSIS FUNCTIONS
 # =====================================================================
-def detect_periodicity(df):
-    w = Window.orderBy("Date")
-    df_temp = df.withColumn("Prev_Date", lag("Date").over(w))
-    df_temp = df_temp.withColumn("Diff", datediff(col("Date"), col("Prev_Date")))
-    avg_diff = df_temp.select(avg("Diff").alias("avgDiff")).first()["avgDiff"]
-    if avg_diff is None:
-        return "N/A"
-    if 0.9 <= avg_diff <= 1.1:
-        return "daily"
-    elif 6 <= avg_diff <= 8:
-        return "weekly"
-    elif 28 <= avg_diff <= 31:
-        return "monthly"
-    else:
-        return f"{avg_diff:.1f} days (non standard)"
-
 def calculate_periodic_returns(df, period):
     if period == "weekly":
         df = df.withColumn("Week", col("Date").substr(1, 7))
@@ -140,6 +139,7 @@ def avg_open_close_different_periods(df):
     df_yearly = df.withColumn("Year", col("Date").substr(1,4))
     df_yearly = df_yearly.groupBy("Year").agg(avg("Open").alias("Avg Open"), avg("Close").alias("Avg Close"))
     results["yearly"] = df_yearly
+
     return results
 
 # =====================================================================
@@ -204,7 +204,6 @@ def main():
         "Conclusions"
     ])
 
-    # ==================== 1) TAB: Data Overview ====================
     with tab_overview:
         st.write("### Total Number of Observations")
         nb_obs = df_spark.count()
@@ -229,11 +228,11 @@ def main():
         detected = detect_periodicity(df_spark)
         st.write(f"### Detected Periodicity: {detected}")
 
-    # ==================== 2) TAB: Time Series Analysis ====================
     with tab_time_series:
         st.subheader("Time Series Analysis")
 
-        window_daily = Window.orderBy("Date")
+        # Utilisation d'une fenêtre partitionnée par Ticker
+        window_daily = Window.partitionBy("Ticker").orderBy("Date")
         df_spark = df_spark.withColumn("Close_Lag1", lag("Close", 1).over(window_daily))
         df_spark = df_spark.withColumn("Daily Price Change", col("Close") - col("Close_Lag1"))
 
@@ -284,7 +283,6 @@ def main():
         periodic_df = calculate_periodic_returns(df_spark, period_for_returns).toPandas()
         st.dataframe(periodic_df)
 
-    # ==================== 3) TAB: Correlations ====================
     with tab_corr:
         st.subheader("Correlations")
         best_s, best_r = best_stock_in_period(
@@ -319,7 +317,7 @@ def main():
                         .select("Date", "Close").orderBy("Date").toPandas()
                 merged_df = pd.merge(df1, df2, on="Date", suffixes=(f"_{stock1}", f"_{stock2}"))
                 if not merged_df.empty:
-                    corr_value = compute_stock_correlation(merged_df[f"Close_{stock1}"], merged_df[f"Close_{stock2}"])
+                    corr_value = merged_df[f"Close_{stock1}"].corr(merged_df[f"Close_{stock2}"])
                     st.success(f"The correlation between {stock1} and {stock2} is: {corr_value:.2f}")
                 else:
                     st.warning("No common data available for the two stocks.")
@@ -336,7 +334,6 @@ def main():
         fig_corr = px.imshow(tickers_corr_data, text_auto=True, title="Correlation Matrix (Stocks)")
         st.plotly_chart(fig_corr, use_container_width=True)
 
-    # ==================== 4) TAB: Conclusions ====================
     with tab_conclusions:
         st.subheader("Conclusions & Insights")
         st.markdown("""
