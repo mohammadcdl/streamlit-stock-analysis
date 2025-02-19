@@ -12,9 +12,12 @@ import plotly.express as px
 import plotly.graph_objects as go
 
 # =====================================================================
-# INITIALIZE SPARK
+# INITIALIZE SPARK WITH CONFIGURATION TO ALLOW BIG RESULTS
 # =====================================================================
-spark = SparkSession.builder.appName("StockAnalysis").getOrCreate()
+spark = SparkSession.builder \
+    .appName("StockAnalysis") \
+    .config("spark.driver.maxResultSize", "2g") \
+    .getOrCreate()
 
 # =====================================================================
 # DATA LOADING AND PREPROCESSING FUNCTIONS
@@ -22,9 +25,9 @@ spark = SparkSession.builder.appName("StockAnalysis").getOrCreate()
 def load_data(ticker, start_date, end_date):
     data = yf.download(ticker, start=start_date, end=end_date)
     data.reset_index(inplace=True)
-    # Assurer que toutes les colonnes sont des chaînes simples
+    # Convertir les noms de colonnes en chaînes simples
     data.columns = [c if isinstance(c, str) else c[0] for c in data.columns]
-    # Ajouter la colonne "Ticker" pour pouvoir partitionner par stock
+    # Ajout de la colonne "Ticker" pour permettre un partitionnement correct
     data['Ticker'] = ticker
     sdf = spark.createDataFrame(data)
     sdf = sdf.withColumn("Date", to_date(col("Date"), "yyyy-MM-dd"))
@@ -34,7 +37,7 @@ def load_data(ticker, start_date, end_date):
     return sdf
 
 def detect_periodicity(df):
-    # Partitionner par Ticker pour des données multiples (même si ici il n'y a qu'un stock)
+    # Utiliser partitionBy("Ticker") pour éviter de rassembler toutes les données
     w = Window.partitionBy("Ticker").orderBy("Date")
     df_temp = df.withColumn("Prev_Date", lag("Date").over(w))
     df_temp = df_temp.withColumn("Diff", datediff(col("Date"), col("Prev_Date")))
@@ -51,7 +54,7 @@ def detect_periodicity(df):
         return f"{avg_diff:.1f} days (non standard)"
 
 def add_moving_average(df, column_name, window_size):
-    # Calculer la moyenne mobile en partitionnant par Ticker
+    # Calcul de la moyenne mobile en partitionnant par Ticker
     window_spec = Window.partitionBy("Ticker").orderBy("Date").rowsBetween(-window_size, 0)
     new_column_name = f"Moving Average ({window_size} days)"
     return df.withColumn(new_column_name, avg(column_name).over(window_spec))
@@ -107,12 +110,7 @@ def calculate_periodic_returns(df, period):
 def best_stock_in_period(tickers, start_date, end_date, period, min_volume=0):
     best_stock = None
     best_return = float('-inf')
-    return_col = {
-        "weekly": "Weekly Return",
-        "monthly": "Monthly Return",
-        "yearly": "Yearly Return"
-    }.get(period, None)
-
+    return_col = {"weekly": "Weekly Return", "monthly": "Monthly Return", "yearly": "Yearly Return"}.get(period, None)
     for name, ticker in tickers.items():
         df_tmp = load_data(ticker, start_date, end_date)
         df_tmp = df_tmp.filter(col("Volume") >= min_volume)
@@ -123,23 +121,19 @@ def best_stock_in_period(tickers, start_date, end_date, period, min_volume=0):
         if avg_r is not None and avg_r > best_return:
             best_return = avg_r
             best_stock = name
-
     return best_stock, best_return if best_return != float('-inf') else None
 
 def avg_open_close_different_periods(df):
     results = {}
-    df_weekly = df.withColumn("Week", col("Date").substr(1,7))
+    df_weekly = df.withColumn("Week", col("Date").substr(1, 7))
     df_weekly = df_weekly.groupBy("Week").agg(avg("Open").alias("Avg Open"), avg("Close").alias("Avg Close"))
     results["weekly"] = df_weekly
-
-    df_monthly = df.withColumn("Month", col("Date").substr(1,7))
+    df_monthly = df.withColumn("Month", col("Date").substr(1, 7))
     df_monthly = df_monthly.groupBy("Month").agg(avg("Open").alias("Avg Open"), avg("Close").alias("Avg Close"))
     results["monthly"] = df_monthly
-
-    df_yearly = df.withColumn("Year", col("Date").substr(1,4))
+    df_yearly = df.withColumn("Year", col("Date").substr(1, 4))
     df_yearly = df_yearly.groupBy("Year").agg(avg("Open").alias("Avg Open"), avg("Close").alias("Avg Close"))
     results["yearly"] = df_yearly
-
     return results
 
 # =====================================================================
@@ -230,12 +224,12 @@ def main():
 
     with tab_time_series:
         st.subheader("Time Series Analysis")
-
-        # Utilisation d'une fenêtre partitionnée par Ticker
+        # Fenêtre partitionnée par Ticker pour les opérations quotidiennes
         window_daily = Window.partitionBy("Ticker").orderBy("Date")
         df_spark = df_spark.withColumn("Close_Lag1", lag("Close", 1).over(window_daily))
         df_spark = df_spark.withColumn("Daily Price Change", col("Close") - col("Close_Lag1"))
 
+        # Pour les opérations mensuelles, partitionner par MonthID (exemple)
         df_spark = df_spark.withColumn("MonthID", col("Date").substr(1, 7))
         window_monthly = Window.partitionBy("MonthID").orderBy("Date")
         df_spark = df_spark.withColumn(
